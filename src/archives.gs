@@ -1,0 +1,148 @@
+// Combined Update Archives workflow: fetch + append new + establish activity + optional change checks
+
+function updateArchives() {
+	var settings = U.readSettings();
+	LOG.info('archives', 'updateArchives:start', '', 'Settings', settings);
+	var username = (settings.username || '').trim();
+	if (!username) {
+		LOG.error('archives', 'updateArchives', '', 'Missing username in Settings');
+		throw new Error('Please set username in Settings sheet.');
+	}
+	var maxArchives = Number(settings.max_archives_per_run || '50');
+	var checkChanges = String(settings.archives_check_before_fetch || 'false').toLowerCase() === 'true';
+
+	var archivesSheet = U.getOrCreateSheet(CONST.SHEET.ARCHIVES);
+	U.ensureHeaders(archivesSheet, CONST.ARCHIVES_HEADERS);
+	var hmap = U.getHeaderIndexMap(archivesSheet);
+
+	// 1) Fetch overall archives list with ETag
+	var listUrl = 'https://api.chess.com/pub/player/' + encodeURIComponent(username) + '/games/archives';
+	var prevEtag = ''; // Optionally persisted; for now read last row etag of list via Properties if desired
+	var resp = HTTP.fetchWithEtag(listUrl, prevEtag);
+	if (resp.status === 304) {
+		LOG.info('archives', 'archivesList', listUrl, 'Not Modified');
+	} else if (resp.status >= 200 && resp.status < 300) {
+		var arr = (resp.json && resp.json.archives) || [];
+		if (!Array.isArray(arr)) arr = [];
+		appendNewArchivesRows(archivesSheet, hmap, arr);
+		LOG.info('archives', 'archivesList', listUrl, 'Fetched archives list', { count: arr.length });
+	} else {
+		LOG.warn('archives', 'archivesList', listUrl, 'Unexpected status ' + resp.status);
+	}
+
+	// 2) Establish activity flags
+	establishArchiveActivity(archivesSheet, hmap);
+
+	// 3) Optional: per-archive change checks
+	if (checkChanges) {
+		checkChangedArchives(archivesSheet, hmap, username, maxArchives);
+	}
+
+	LOG.info('archives', 'updateArchives:end', '', 'Done');
+}
+
+function appendNewArchivesRows(sheet, hmap, archiveUrls) {
+	if (!archiveUrls.length) return;
+	var lastRow = sheet.getLastRow();
+	var existing = {};
+	if (lastRow >= 2) {
+		var urls = sheet.getRange(2, hmap['archive_url'], lastRow - 1, 1).getValues().map(function(r){ return String(r[0]||''); });
+		for (var i = 0; i < urls.length; i++) if (urls[i]) existing[urls[i]] = true;
+	}
+	var currentMaxId = 0;
+	if (lastRow >= 2) {
+		var ids = sheet.getRange(2, hmap['id'], lastRow - 1, 1).getValues().map(function(r){ return Number(r[0]||0); });
+		for (var j = 0; j < ids.length; j++) if (ids[j] > currentMaxId) currentMaxId = ids[j];
+	}
+	var toWrite = [];
+	for (var k = 0; k < archiveUrls.length; k++) {
+		var url = String(archiveUrls[k]);
+		if (existing[url]) continue;
+		var parts = url.split('/');
+		var mm = parts.pop();
+		var yyyy = parts.pop();
+		var name = yyyy + '-' + mm;
+		toWrite.push([
+			currentMaxId + toWrite.length + 1, // id
+			url,                              // archive_url
+			name,                             // archive_name
+			Number(yyyy),                     // year
+			Number(mm),                       // month
+			'',                               // etag
+			'',                               // last_modified
+			'',                               // last_checked_changes_ts
+			'',                               // last_checked_new_ts
+			'',                               // last_seen_url
+			'',                               // game_count
+			true,                             // is_active (initially true until evaluated)
+			U.now(),                          // created_ts
+			U.now(),                          // updated_ts
+			''                                // notes
+		]);
+	}
+	if (toWrite.length) sheet.getRange(sheet.getLastRow() + 1, 1, toWrite.length, CONST.ARCHIVES_HEADERS.length).setValues(toWrite);
+}
+
+function endOfMonth(year, month) {
+	// month: 1-12
+	var d = new Date(year, month, 0, 23, 59, 59, 999);
+	return d;
+}
+
+function establishArchiveActivity(sheet, hmap) {
+	var lastRow = sheet.getLastRow();
+	if (lastRow < 2) return;
+	var values = sheet.getRange(2, 1, lastRow - 1, CONST.ARCHIVES_HEADERS.length).getValues();
+	var updates = [];
+	for (var i = 0; i < values.length; i++) {
+		var row = values[i];
+		var year = Number(row[hmap['year'] - 1] || 0);
+		var month = Number(row[hmap['month'] - 1] || 0);
+		var lastChecked = row[hmap['last_checked_changes_ts'] - 1];
+		var isActive = true;
+		if (lastChecked instanceof Date) {
+			var eom = endOfMonth(year, month);
+			if (lastChecked.getTime() > eom.getTime()) isActive = false;
+		}
+		row[hmap['is_active'] - 1] = isActive;
+		row[hmap['updated_ts'] - 1] = U.now();
+		updates.push(row);
+	}
+	sheet.getRange(2, 1, updates.length, CONST.ARCHIVES_HEADERS.length).setValues(updates);
+}
+
+function checkChangedArchives(sheet, hmap, username, maxArchives) {
+	var lastRow = sheet.getLastRow();
+	if (lastRow < 2) return;
+	var values = sheet.getRange(2, 1, lastRow - 1, CONST.ARCHIVES_HEADERS.length).getValues();
+	var checked = 0;
+	for (var i = 0; i < values.length; i++) {
+		if (checked >= maxArchives) break;
+		var row = values[i];
+		var url = String(row[hmap['archive_url'] - 1] || '');
+		if (!url) continue;
+		var etag = String(row[hmap['etag'] - 1] || '');
+		var resp = HTTP.fetchWithEtag(url, etag);
+		var changed = false;
+		if (resp.status === 304) {
+			changed = false;
+		} else if (resp.status >= 200 && resp.status < 300) {
+			// Month body available; compare game count or last URL if needed
+			var games = (resp.json && (resp.json.games || resp.json['games'])) || [];
+			var newCount = Array.isArray(games) ? games.length : 0;
+			var oldCount = Number(row[hmap['game_count'] - 1] || 0);
+			if (resp.etag && resp.etag !== etag) changed = true;
+			else if (newCount !== oldCount) changed = true;
+			row[hmap['etag'] - 1] = resp.etag || row[hmap['etag'] - 1];
+			row[hmap['last_modified'] - 1] = resp.lastModified || row[hmap['last_modified'] - 1];
+			row[hmap['game_count'] - 1] = newCount;
+		} else {
+			LOG.warn('archives', 'checkChanged', url, 'HTTP ' + resp.status);
+		}
+		row[hmap['last_checked_changes_ts'] - 1] = U.now();
+		row[hmap['updated_ts'] - 1] = U.now();
+		values[i] = row;
+		checked++;
+	}
+	sheet.getRange(2, 1, values.length, CONST.ARCHIVES_HEADERS.length).setValues(values);
+}
