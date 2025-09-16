@@ -314,6 +314,14 @@ function processCallbackQueue() {
 		return;
 	}
 	var rows = sheet.getRange(2, 1, lastRow - 1, CONST.GAMES_HEADERS.length).getValues();
+
+	function ensureCallbackHeader(headerName) {
+		// Ensure a header like "callback.someField" exists; append if missing
+		if (gh[headerName]) return;
+		var lastCol = sheet.getLastColumn();
+		sheet.getRange(1, lastCol + 1).setValue(headerName);
+		gh = U.getHeaderIndexMap(sheet);
+	}
 	var processed = 0;
 	for (var i = 0; i < rows.length; i++) {
 		if (processed >= maxCallbacks) break;
@@ -333,18 +341,50 @@ function processCallbackQueue() {
 			if (resp && resp.status >= 200 && resp.status < 300) {
 				row[gh['callback.status'] - 1] = 'ok';
 				row[gh['callback.last_error'] - 1] = '';
-				// Opportunistically map known fields if they exist
+				// Map all callback fields dynamically: add headers and write values
 				var j = resp.json || {};
-				if (gh['callback.ratingChangeWhite'] && j.ratingChangeWhite != null) row[gh['callback.ratingChangeWhite'] - 1] = Number(j.ratingChangeWhite);
-				if (gh['callback.ratingChangeBlack'] && j.ratingChangeBlack != null) row[gh['callback.ratingChangeBlack'] - 1] = Number(j.ratingChangeBlack);
-				if (gh['callback.ratingChangeMe'] && j.ratingChangeMe != null) row[gh['callback.ratingChangeMe'] - 1] = Number(j.ratingChangeMe);
-				if (gh['callback.ratingChangeOpponent'] && j.ratingChangeOpponent != null) row[gh['callback.ratingChangeOpponent'] - 1] = Number(j.ratingChangeOpponent);
-				if (gh['callback.gameEndReason'] && j.gameEndReason != null) row[gh['callback.gameEndReason'] - 1] = String(j.gameEndReason);
-				if (gh['callback.resultMessage'] && j.resultMessage != null) row[gh['callback.resultMessage'] - 1] = String(j.resultMessage);
-				if (gh['callback.plyCount'] && j.plyCount != null) row[gh['callback.plyCount'] - 1] = Number(j.plyCount);
-				if (gh['callback.isCheckmate'] && j.isCheckmate != null) row[gh['callback.isCheckmate'] - 1] = !!j.isCheckmate;
-				if (gh['callback.isStalemate'] && j.isStalemate != null) row[gh['callback.isStalemate'] - 1] = !!j.isStalemate;
-				if (gh['callback.colorOfWinner'] && j.colorOfWinner != null) row[gh['callback.colorOfWinner'] - 1] = String(j.colorOfWinner);
+				for (var k in j) {
+					if (!Object.prototype.hasOwnProperty.call(j, k)) continue;
+					var h = 'callback.' + String(k);
+					ensureCallbackHeader(h);
+					var idx = gh[h] - 1;
+					var val = j[k];
+					if (val != null && typeof val === 'object') {
+						try { val = JSON.stringify(val); } catch (ejson) { val = String(val); }
+					}
+					if (typeof val === 'boolean') {
+						row[idx] = !!val;
+					} else if (typeof val === 'number') {
+						row[idx] = Number(val);
+					} else {
+						row[idx] = String(val != null ? val : '');
+					}
+				}
+				// Also compute pregame ratings if possible
+				var myRatingIdx = gh['my.rating'] ? gh['my.rating'] - 1 : -1;
+				var oppRatingIdx = gh['opponent.rating'] ? gh['opponent.rating'] - 1 : -1;
+				var myPreIdx = gh['my.pregame_rating'] ? gh['my.pregame_rating'] - 1 : -1;
+				var oppPreIdx = gh['opponent.pregame_rating'] ? gh['opponent.pregame_rating'] - 1 : -1;
+				if (myPreIdx >= 0 && myRatingIdx >= 0) {
+					var rcMe = (j.ratingChangeMe != null) ? Number(j.ratingChangeMe) : null;
+					if (rcMe == null) {
+						var myColor = gh['my.color'] ? String(row[gh['my.color'] - 1] || '') : '';
+						rcMe = (myColor === 'white' && j.ratingChangeWhite != null) ? Number(j.ratingChangeWhite)
+							: (myColor === 'black' && j.ratingChangeBlack != null) ? Number(j.ratingChangeBlack) : null;
+					}
+					var cur = Number(row[myRatingIdx] || 0);
+					if (rcMe != null && cur) row[myPreIdx] = cur - rcMe;
+				}
+				if (oppPreIdx >= 0 && oppRatingIdx >= 0) {
+					var rcOpp = (j.ratingChangeOpponent != null) ? Number(j.ratingChangeOpponent) : null;
+					if (rcOpp == null) {
+						var myColor2 = gh['my.color'] ? String(row[gh['my.color'] - 1] || '') : '';
+						rcOpp = (myColor2 === 'white' && j.ratingChangeBlack != null) ? Number(j.ratingChangeBlack)
+							: (myColor2 === 'black' && j.ratingChangeWhite != null) ? Number(j.ratingChangeWhite) : null;
+					}
+					var curOpp = Number(row[oppRatingIdx] || 0);
+					if (rcOpp != null && curOpp) row[oppPreIdx] = curOpp - rcOpp;
+				}
 			} else {
 				row[gh['callback.status'] - 1] = 'error';
 				row[gh['callback.last_error'] - 1] = 'HTTP ' + (resp ? resp.status : 'ERR');
@@ -355,8 +395,11 @@ function processCallbackQueue() {
 			row[gh['callback.last_attempt_ts'] - 1] = U.now();
 			rsp = null;
 		}
-		// Persist this row
-		sheet.getRange(i + 2, 1, 1, CONST.GAMES_HEADERS.length).setValues([row]);
+		// Persist this row across full current width (in case we added headers dynamically)
+		var fullWidth = sheet.getLastColumn();
+		var rowExpanded = sheet.getRange(i + 2, 1, 1, fullWidth).getValues()[0];
+		for (var c = 0; c < Math.min(rowExpanded.length, row.length); c++) rowExpanded[c] = row[c];
+		sheet.getRange(i + 2, 1, 1, fullWidth).setValues([rowExpanded]);
 		processed++;
 	}
 	LOG.info('callbacks', 'processCallbackQueue:end', '', 'Processed', { processed: processed });
@@ -460,38 +503,94 @@ function dailyRollupRebuild() {
 	var gh = U.getHeaderIndexMap(gamesSheet);
 	var last = gamesSheet.getLastRow();
 	var rollSheet = U.getOrCreateSheet(CONST.SHEET.DAILY_ROLLUP);
-	U.ensureHeaders(rollSheet, CONST.DAILY_ROLLUP_PREFIX_HEADERS);
-	var agg = {};
+	// Discover formats from Games sheet
+	var formats = {};
+	var tz = SpreadsheetApp.getActive().getSpreadsheetTimeZone();
+	var minDate = null;
+	var maxDate = null;
 	if (last >= 2) {
-		var tz = SpreadsheetApp.getActive().getSpreadsheetTimeZone();
 		var vals = gamesSheet.getRange(2, 1, last - 1, CONST.GAMES_HEADERS.length).getValues();
 		for (var i = 0; i < vals.length; i++) {
 			var r = vals[i];
+			var fmt = String(r[gh['format'] - 1] || '').trim();
+			if (fmt) formats[fmt] = true;
 			var endDt = r[gh['end_dt'] - 1];
-			if (!(endDt && endDt instanceof Date)) continue;
-			var day = Utilities.formatDate(endDt, tz, 'yyyy-MM-dd');
-			if (!agg[day]) agg[day] = { wins: 0, losses: 0, draws: 0, duration: 0 };
-			var res = String(r[gh['my.result'] - 1] || '').toLowerCase();
-			if (res === 'win') agg[day].wins++;
-			else if (res === 'loss') agg[day].losses++;
-			else if (res === 'draw' || res === 'stalemate' || res === 'agreed') agg[day].draws++;
-			agg[day].duration += Number(r[gh['duration'] - 1] || 0);
+			if (endDt && endDt instanceof Date) {
+				if (!minDate || endDt < minDate) minDate = endDt;
+				if (!maxDate || endDt > maxDate) maxDate = endDt;
+			}
 		}
 	}
-	// Write out sorted by date ascending
-	var keys = Object.keys(agg).sort();
-	// Clear existing (except header)
+	// Build dynamic headers
+	var dynamicHeaders = CONST.DAILY_ROLLUP_PREFIX_HEADERS.slice();
+	var fmtList = Object.keys(formats).sort();
+	for (var f = 0; f < fmtList.length; f++) {
+		var base = fmtList[f];
+		dynamicHeaders.push(base + '.wins');
+		dynamicHeaders.push(base + '.losses');
+		dynamicHeaders.push(base + '.draws');
+		dynamicHeaders.push(base + '.duration_seconds');
+	}
+	// Write headers (override to include formats)
+	rollSheet.getRange(1, 1, 1, dynamicHeaders.length).setValues([dynamicHeaders]);
+	rollSheet.setFrozenRows(1);
+	// Aggregate per-day totals and per-format totals
+	var agg = {};
+	if (last >= 2) {
+		var vals2 = gamesSheet.getRange(2, 1, last - 1, CONST.GAMES_HEADERS.length).getValues();
+		for (var i2 = 0; i2 < vals2.length; i2++) {
+			var row = vals2[i2];
+			var endDt2 = row[gh['end_dt'] - 1];
+			if (!(endDt2 && endDt2 instanceof Date)) continue;
+			var day = Utilities.formatDate(endDt2, tz, 'yyyy-MM-dd');
+			if (!agg[day]) agg[day] = { all: { wins: 0, losses: 0, draws: 0, duration: 0 }, byFmt: {} };
+			var res = String(row[gh['my.result'] - 1] || '').toLowerCase();
+			if (res === 'win') agg[day].all.wins++;
+			else if (res === 'loss') agg[day].all.losses++;
+			else if (res === 'draw' || res === 'stalemate' || res === 'agreed') agg[day].all.draws++;
+			agg[day].all.duration += Number(row[gh['duration'] - 1] || 0);
+			var fmt2 = String(row[gh['format'] - 1] || '').trim();
+			if (fmt2) {
+				if (!agg[day].byFmt[fmt2]) agg[day].byFmt[fmt2] = { wins: 0, losses: 0, draws: 0, duration: 0 };
+				if (res === 'win') agg[day].byFmt[fmt2].wins++;
+				else if (res === 'loss') agg[day].byFmt[fmt2].losses++;
+				else if (res === 'draw' || res === 'stalemate' || res === 'agreed') agg[day].byFmt[fmt2].draws++;
+				agg[day].byFmt[fmt2].duration += Number(row[gh['duration'] - 1] || 0);
+			}
+		}
+	}
+	// Build a complete date list even for empty days
+	var datesList = [];
+	if (minDate && maxDate) {
+		var start = new Date(Date.UTC(minDate.getUTCFullYear(), minDate.getUTCMonth(), minDate.getUTCDate()));
+		var end = new Date(Date.UTC(maxDate.getUTCFullYear(), maxDate.getUTCMonth(), maxDate.getUTCDate()));
+		for (var d = new Date(start); d <= end; d.setUTCDate(d.getUTCDate() + 1)) {
+			var key = Utilities.formatDate(d, tz, 'yyyy-MM-dd');
+			datesList.push(key);
+			if (!agg[key]) agg[key] = { all: { wins: 0, losses: 0, draws: 0, duration: 0 }, byFmt: {} };
+		}
+	} else {
+		// No games: keep sheet with only headers
+		if (rollSheet.getLastRow() > 1) rollSheet.getRange(2, 1, rollSheet.getLastRow() - 1, rollSheet.getLastColumn()).clearContent();
+		LOG.info('rollup', 'dailyRollupRebuild:end', '', 'Rebuilt', { days: 0 });
+		return;
+	}
+	// Clear existing content and write new values across full header width
 	if (rollSheet.getLastRow() > 1) rollSheet.getRange(2, 1, rollSheet.getLastRow() - 1, rollSheet.getLastColumn()).clearContent();
-	if (keys.length) {
-		var out = new Array(keys.length);
-		for (var k = 0; k < keys.length; k++) {
-			var d = keys[k];
-			var a = agg[d];
-			out[k] = [new Date(d + 'T00:00:00Z'), a.wins, a.losses, a.draws, a.duration];
+	var out = new Array(datesList.length);
+	for (var k = 0; k < datesList.length; k++) {
+		var dayKey = datesList[k];
+		var a = agg[dayKey] || { all: { wins: 0, losses: 0, draws: 0, duration: 0 }, byFmt: {} };
+		var rowVals = [new Date(dayKey + 'T00:00:00Z'), a.all.wins, a.all.losses, a.all.draws, a.all.duration];
+		for (var f2 = 0; f2 < fmtList.length; f2++) {
+			var base2 = fmtList[f2];
+			var sub = a.byFmt[base2] || { wins: 0, losses: 0, draws: 0, duration: 0 };
+			rowVals.push(sub.wins, sub.losses, sub.draws, sub.duration);
 		}
-		rollSheet.getRange(2, 1, out.length, CONST.DAILY_ROLLUP_PREFIX_HEADERS.length).setValues(out);
+		out[k] = rowVals;
 	}
-	LOG.info('rollup', 'dailyRollupRebuild:end', '', 'Rebuilt', { days: keys.length });
+	if (out.length) rollSheet.getRange(2, 1, out.length, dynamicHeaders.length).setValues(out);
+	LOG.info('rollup', 'dailyRollupRebuild:end', '', 'Rebuilt', { days: datesList.length, formats: fmtList.length });
 }
 
 function rebuildMeta() {
@@ -552,46 +651,83 @@ function dailyRollupIncremental(dates) {
 	if (last < 2) return;
 	var tz = SpreadsheetApp.getActive().getSpreadsheetTimeZone();
 	var vals = gamesSheet.getRange(2, 1, last - 1, CONST.GAMES_HEADERS.length).getValues();
+	// Discover formats globally to keep headers up to date
+	var formats = {};
+	for (var r0 = 0; r0 < vals.length; r0++) {
+		var fmt0 = String(vals[r0][gh['format'] - 1] || '').trim();
+		if (fmt0) formats[fmt0] = true;
+	}
+	var fmtList = Object.keys(formats).sort();
+	// Ensure rollup headers include formats
+	var rollSheet = U.getOrCreateSheet(CONST.SHEET.DAILY_ROLLUP);
+	var desiredHeaders = CONST.DAILY_ROLLUP_PREFIX_HEADERS.slice();
+	for (var f = 0; f < fmtList.length; f++) {
+		var base = fmtList[f];
+		desiredHeaders.push(base + '.wins');
+		desiredHeaders.push(base + '.losses');
+		desiredHeaders.push(base + '.draws');
+		desiredHeaders.push(base + '.duration_seconds');
+	}
+	rollSheet.getRange(1, 1, 1, desiredHeaders.length).setValues([desiredHeaders]);
+	rollSheet.setFrozenRows(1);
+	// Build date->row map using only first column
+	var lastR = rollSheet.getLastRow();
+	var existing = {};
+	if (lastR >= 2) {
+		var dr = rollSheet.getRange(2, 1, lastR - 1, 1).getValues();
+		for (var i2 = 0; i2 < dr.length; i2++) {
+			var dval = dr[i2][0];
+			if (dval && dval instanceof Date) {
+				var key = Utilities.formatDate(dval, tz, 'yyyy-MM-dd');
+				existing[key] = i2 + 2;
+			}
+		}
+	}
+	// Aggregate only target days; also initialize zero for all requested days
 	var agg = {};
+	for (var d in set) if (Object.prototype.hasOwnProperty.call(set, d)) agg[d] = { all: { wins: 0, losses: 0, draws: 0, duration: 0 }, byFmt: {} };
 	for (var r = 0; r < vals.length; r++) {
 		var row = vals[r];
 		var endDt = row[gh['end_dt'] - 1];
 		if (!(endDt && endDt instanceof Date)) continue;
 		var day = Utilities.formatDate(endDt, tz, 'yyyy-MM-dd');
 		if (!set[day]) continue;
-		if (!agg[day]) agg[day] = { wins: 0, losses: 0, draws: 0, duration: 0 };
+		if (!agg[day]) agg[day] = { all: { wins: 0, losses: 0, draws: 0, duration: 0 }, byFmt: {} };
 		var res = String(row[gh['my.result'] - 1] || '').toLowerCase();
-		if (res === 'win') agg[day].wins++;
-		else if (res === 'loss') agg[day].losses++;
-		else if (res === 'draw' || res === 'stalemate' || res === 'agreed') agg[day].draws++;
-		agg[day].duration += Number(row[gh['duration'] - 1] || 0);
-	}
-	var rollSheet = U.getOrCreateSheet(CONST.SHEET.DAILY_ROLLUP);
-	U.ensureHeaders(rollSheet, CONST.DAILY_ROLLUP_PREFIX_HEADERS);
-	// Build a map of date->rowIndex (in sheet coordinates)
-	var dh = (function(){ var m = {}; for (var i = 0; i < CONST.DAILY_ROLLUP_PREFIX_HEADERS.length; i++) m[CONST.DAILY_ROLLUP_PREFIX_HEADERS[i]] = i + 1; return m; })();
-	var lastR = rollSheet.getLastRow();
-	var existing = {};
-	if (lastR >= 2) {
-		var dr = rollSheet.getRange(2, 1, lastR - 1, CONST.DAILY_ROLLUP_PREFIX_HEADERS.length).getValues();
-		for (var i2 = 0; i2 < dr.length; i2++) {
-			var dval = dr[i2][0];
-			if (dval && dval instanceof Date) {
-				var key = Utilities.formatDate(dval, tz, 'yyyy-MM-dd');
-				existing[key] = i2 + 2; // sheet row index
-			}
+		if (res === 'win') agg[day].all.wins++;
+		else if (res === 'loss') agg[day].all.losses++;
+		else if (res === 'draw' || res === 'stalemate' || res === 'agreed') agg[day].all.draws++;
+		agg[day].all.duration += Number(row[gh['duration'] - 1] || 0);
+		var fmt = String(row[gh['format'] - 1] || '').trim();
+		if (fmt) {
+			if (!agg[day].byFmt[fmt]) agg[day].byFmt[fmt] = { wins: 0, losses: 0, draws: 0, duration: 0 };
+			if (res === 'win') agg[day].byFmt[fmt].wins++;
+			else if (res === 'loss') agg[day].byFmt[fmt].losses++;
+			else if (res === 'draw' || res === 'stalemate' || res === 'agreed') agg[day].byFmt[fmt].draws++;
+			agg[day].byFmt[fmt].duration += Number(row[gh['duration'] - 1] || 0);
 		}
 	}
-	var keys = Object.keys(agg);
-	for (var k = 0; k < keys.length; k++) {
-		var day = keys[k];
-		var a = agg[day];
-		var rowVals = [new Date(day + 'T00:00:00Z'), a.wins, a.losses, a.draws, a.duration];
-		if (existing[day]) {
-			rollSheet.getRange(existing[day], 1, 1, CONST.DAILY_ROLLUP_PREFIX_HEADERS.length).setValues([rowVals]);
+	// Write rows for all requested days (even if zero)
+	var headerLen = desiredHeaders.length;
+	var targetDays = Object.keys(set).sort();
+	for (var k = 0; k < targetDays.length; k++) {
+		var dayKey = targetDays[k];
+		var a = agg[dayKey] || { all: { wins: 0, losses: 0, draws: 0, duration: 0 }, byFmt: {} };
+		var rowVals = [new Date(dayKey + 'T00:00:00Z'), a.all.wins, a.all.losses, a.all.draws, a.all.duration];
+		for (var f2 = 0; f2 < fmtList.length; f2++) {
+			var base2 = fmtList[f2];
+			var sub = a.byFmt[base2] || { wins: 0, losses: 0, draws: 0, duration: 0 };
+			rowVals.push(sub.wins, sub.losses, sub.draws, sub.duration);
+		}
+		if (existing[dayKey]) {
+			rollSheet.getRange(existing[dayKey], 1, 1, headerLen).setValues([rowVals]);
 		} else {
 			rollSheet.appendRow(rowVals);
+			// Ensure appended row has all columns; appendRow may not fill trailing empty columns, so set explicitly if needed
+			var lr = rollSheet.getLastRow();
+			if (rollSheet.getLastColumn() < headerLen) rollSheet.insertColumnsAfter(rollSheet.getLastColumn(), headerLen - rollSheet.getLastColumn());
+			rollSheet.getRange(lr, 1, 1, headerLen).setValues([rowVals]);
 		}
 	}
-	LOG.info('rollup', 'dailyRollupIncremental:end', '', 'Updated days', { days: keys.length });
+	LOG.info('rollup', 'dailyRollupIncremental:end', '', 'Updated days', { days: targetDays.length, formats: fmtList.length });
 }
