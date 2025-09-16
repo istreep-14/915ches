@@ -503,11 +503,14 @@ function dailyRollupRebuild() {
 	var gh = U.getHeaderIndexMap(gamesSheet);
 	var last = gamesSheet.getLastRow();
 	var rollSheet = U.getOrCreateSheet(CONST.SHEET.DAILY_ROLLUP);
-	// Discover formats from Games sheet
+	// Discover formats and rating timelines from Games sheet
 	var formats = {};
 	var tz = SpreadsheetApp.getActive().getSpreadsheetTimeZone();
 	var minDate = null;
-	var maxDate = null;
+	var today = new Date();
+	var todayKey = Utilities.formatDate(today, tz, 'yyyy-MM-dd');
+	var todayStart = new Date(todayKey + 'T00:00:00Z');
+	var ratingTimeline = {};
 	if (last >= 2) {
 		var vals = gamesSheet.getRange(2, 1, last - 1, CONST.GAMES_HEADERS.length).getValues();
 		for (var i = 0; i < vals.length; i++) {
@@ -517,11 +520,16 @@ function dailyRollupRebuild() {
 			var endDt = r[gh['end_dt'] - 1];
 			if (endDt && endDt instanceof Date) {
 				if (!minDate || endDt < minDate) minDate = endDt;
-				if (!maxDate || endDt > maxDate) maxDate = endDt;
+				var rate = Number(r[gh['my.rating'] - 1] || 0);
+				if (fmt && rate) {
+					if (!ratingTimeline[fmt]) ratingTimeline[fmt] = [];
+					var key = Utilities.formatDate(endDt, tz, 'yyyy-MM-dd');
+					ratingTimeline[fmt].push({ key: key, ts: endDt.getTime(), rating: rate });
+				}
 			}
 		}
 	}
-	// Build dynamic headers
+	// Build dynamic headers with per-format metrics and ratings
 	var dynamicHeaders = CONST.DAILY_ROLLUP_PREFIX_HEADERS.slice();
 	var fmtList = Object.keys(formats).sort();
 	for (var f = 0; f < fmtList.length; f++) {
@@ -530,6 +538,8 @@ function dailyRollupRebuild() {
 		dynamicHeaders.push(base + '.losses');
 		dynamicHeaders.push(base + '.draws');
 		dynamicHeaders.push(base + '.duration_seconds');
+		dynamicHeaders.push(base + '.rating_begin');
+		dynamicHeaders.push(base + '.rating_end');
 	}
 	// Write headers (override to include formats)
 	rollSheet.getRange(1, 1, 1, dynamicHeaders.length).setValues([dynamicHeaders]);
@@ -559,21 +569,22 @@ function dailyRollupRebuild() {
 			}
 		}
 	}
-	// Build a complete date list even for empty days
+	// Prepare rating timelines (sort by key asc, then ts asc)
+	for (var ff = 0; ff < fmtList.length; ff++) {
+		var fmtKey = fmtList[ff];
+		if (ratingTimeline[fmtKey]) ratingTimeline[fmtKey].sort(function(a, b){
+			if (a.key === b.key) return a.ts - b.ts;
+			return a.key < b.key ? -1 : 1;
+		});
+	}
+	// Build a complete date list even for empty days, from earliest game day to today, descending
 	var datesList = [];
-	if (minDate && maxDate) {
-		var start = new Date(Date.UTC(minDate.getUTCFullYear(), minDate.getUTCMonth(), minDate.getUTCDate()));
-		var end = new Date(Date.UTC(maxDate.getUTCFullYear(), maxDate.getUTCMonth(), maxDate.getUTCDate()));
-		for (var d = new Date(start); d <= end; d.setUTCDate(d.getUTCDate() + 1)) {
-			var key = Utilities.formatDate(d, tz, 'yyyy-MM-dd');
-			datesList.push(key);
-			if (!agg[key]) agg[key] = { all: { wins: 0, losses: 0, draws: 0, duration: 0 }, byFmt: {} };
-		}
-	} else {
-		// No games: keep sheet with only headers
-		if (rollSheet.getLastRow() > 1) rollSheet.getRange(2, 1, rollSheet.getLastRow() - 1, rollSheet.getLastColumn()).clearContent();
-		LOG.info('rollup', 'dailyRollupRebuild:end', '', 'Rebuilt', { days: 0 });
-		return;
+	var startDate = minDate ? new Date(Date.UTC(minDate.getUTCFullYear(), minDate.getUTCMonth(), minDate.getUTCDate())) : todayStart;
+	var endDate = todayStart;
+	for (var d = new Date(endDate); d >= startDate; d.setUTCDate(d.getUTCDate() - 1)) {
+		var keyd = Utilities.formatDate(d, tz, 'yyyy-MM-dd');
+		datesList.push(keyd);
+		if (!agg[keyd]) agg[keyd] = { all: { wins: 0, losses: 0, draws: 0, duration: 0 }, byFmt: {} };
 	}
 	// Clear existing content and write new values across full header width
 	if (rollSheet.getLastRow() > 1) rollSheet.getRange(2, 1, rollSheet.getLastRow() - 1, rollSheet.getLastColumn()).clearContent();
@@ -582,14 +593,38 @@ function dailyRollupRebuild() {
 		var dayKey = datesList[k];
 		var a = agg[dayKey] || { all: { wins: 0, losses: 0, draws: 0, duration: 0 }, byFmt: {} };
 		var rowVals = [new Date(dayKey + 'T00:00:00Z'), a.all.wins, a.all.losses, a.all.draws, a.all.duration];
+		function lastRatingKeyBeforeOrAt(arr, key) {
+			var lo = 0, hi = arr.length - 1, ans = null;
+			while (lo <= hi) {
+				var mid = (lo + hi) >> 1;
+				if (arr[mid].key <= key) { ans = arr[mid].rating; lo = mid + 1; } else { hi = mid - 1; }
+			}
+			return ans;
+		}
+		function lastRatingKeyBefore(arr, key) {
+			// find last with key strictly less than given key
+			var lo = 0, hi = arr.length - 1, ans = null;
+			while (lo <= hi) {
+				var mid = (lo + hi) >> 1;
+				if (arr[mid].key < key) { ans = arr[mid].rating; lo = mid + 1; } else { hi = mid - 1; }
+			}
+			return ans;
+		}
 		for (var f2 = 0; f2 < fmtList.length; f2++) {
 			var base2 = fmtList[f2];
 			var sub = a.byFmt[base2] || { wins: 0, losses: 0, draws: 0, duration: 0 };
 			rowVals.push(sub.wins, sub.losses, sub.draws, sub.duration);
+			var tl = ratingTimeline[base2] || [];
+			var rBegin = lastRatingKeyBefore(tl, dayKey);
+			var rEnd = lastRatingKeyBeforeOrAt(tl, dayKey);
+			rowVals.push(rBegin != null ? Number(rBegin) : '', rEnd != null ? Number(rEnd) : '');
 		}
 		out[k] = rowVals;
 	}
 	if (out.length) rollSheet.getRange(2, 1, out.length, dynamicHeaders.length).setValues(out);
+	// Ensure sheet sorted latest date first
+	var lr = rollSheet.getLastRow();
+	if (lr > 2) rollSheet.getRange(2, 1, lr - 1, dynamicHeaders.length).sort({ column: 1, ascending: false });
 	LOG.info('rollup', 'dailyRollupRebuild:end', '', 'Rebuilt', { days: datesList.length, formats: fmtList.length });
 }
 
@@ -658,7 +693,7 @@ function dailyRollupIncremental(dates) {
 		if (fmt0) formats[fmt0] = true;
 	}
 	var fmtList = Object.keys(formats).sort();
-	// Ensure rollup headers include formats
+	// Ensure rollup headers include formats and rating columns
 	var rollSheet = U.getOrCreateSheet(CONST.SHEET.DAILY_ROLLUP);
 	var desiredHeaders = CONST.DAILY_ROLLUP_PREFIX_HEADERS.slice();
 	for (var f = 0; f < fmtList.length; f++) {
@@ -667,6 +702,8 @@ function dailyRollupIncremental(dates) {
 		desiredHeaders.push(base + '.losses');
 		desiredHeaders.push(base + '.draws');
 		desiredHeaders.push(base + '.duration_seconds');
+		desiredHeaders.push(base + '.rating_begin');
+		desiredHeaders.push(base + '.rating_end');
 	}
 	rollSheet.getRange(1, 1, 1, desiredHeaders.length).setValues([desiredHeaders]);
 	rollSheet.setFrozenRows(1);
@@ -682,6 +719,28 @@ function dailyRollupIncremental(dates) {
 				existing[key] = i2 + 2;
 			}
 		}
+	}
+	// Build rating timelines per format
+	var ratingTimeline = {};
+	for (var ri = 0; ri < vals.length; ri++) {
+		var rrow = vals[ri];
+		var fmtR = String(rrow[gh['format'] - 1] || '').trim();
+		var endDtR = rrow[gh['end_dt'] - 1];
+		if (fmtR && endDtR && endDtR instanceof Date) {
+			var rateR = Number(rrow[gh['my.rating'] - 1] || 0);
+			if (rateR) {
+				if (!ratingTimeline[fmtR]) ratingTimeline[fmtR] = [];
+				var keyR = Utilities.formatDate(endDtR, tz, 'yyyy-MM-dd');
+				ratingTimeline[fmtR].push({ key: keyR, ts: endDtR.getTime(), rating: rateR });
+			}
+		}
+	}
+	for (var ff = 0; ff < fmtList.length; ff++) {
+		var keyFmt = fmtList[ff];
+		if (ratingTimeline[keyFmt]) ratingTimeline[keyFmt].sort(function(a,b){
+			if (a.key === b.key) return a.ts - b.ts;
+			return a.key < b.key ? -1 : 1;
+		});
 	}
 	// Aggregate only target days; also initialize zero for all requested days
 	var agg = {};
@@ -707,9 +766,25 @@ function dailyRollupIncremental(dates) {
 			agg[day].byFmt[fmt].duration += Number(row[gh['duration'] - 1] || 0);
 		}
 	}
-	// Write rows for all requested days (even if zero)
+	// Write rows for all requested days (even if zero), newest first
 	var headerLen = desiredHeaders.length;
-	var targetDays = Object.keys(set).sort();
+	var targetDays = Object.keys(set).sort().reverse();
+	function lastRatingKeyBeforeOrAt(arr, key) {
+		var lo = 0, hi = arr.length - 1, ans = null;
+		while (lo <= hi) {
+			var mid = (lo + hi) >> 1;
+			if (arr[mid].key <= key) { ans = arr[mid].rating; lo = mid + 1; } else { hi = mid - 1; }
+		}
+		return ans;
+	}
+	function lastRatingKeyBefore(arr, key) {
+		var lo = 0, hi = arr.length - 1, ans = null;
+		while (lo <= hi) {
+			var mid = (lo + hi) >> 1;
+			if (arr[mid].key < key) { ans = arr[mid].rating; lo = mid + 1; } else { hi = mid - 1; }
+		}
+		return ans;
+	}
 	for (var k = 0; k < targetDays.length; k++) {
 		var dayKey = targetDays[k];
 		var a = agg[dayKey] || { all: { wins: 0, losses: 0, draws: 0, duration: 0 }, byFmt: {} };
@@ -718,16 +793,22 @@ function dailyRollupIncremental(dates) {
 			var base2 = fmtList[f2];
 			var sub = a.byFmt[base2] || { wins: 0, losses: 0, draws: 0, duration: 0 };
 			rowVals.push(sub.wins, sub.losses, sub.draws, sub.duration);
+			var tl = ratingTimeline[base2] || [];
+			var rBegin = lastRatingKeyBefore(tl, dayKey);
+			var rEnd = lastRatingKeyBeforeOrAt(tl, dayKey);
+			rowVals.push(rBegin != null ? Number(rBegin) : '', rEnd != null ? Number(rEnd) : '');
 		}
 		if (existing[dayKey]) {
 			rollSheet.getRange(existing[dayKey], 1, 1, headerLen).setValues([rowVals]);
 		} else {
 			rollSheet.appendRow(rowVals);
-			// Ensure appended row has all columns; appendRow may not fill trailing empty columns, so set explicitly if needed
-			var lr = rollSheet.getLastRow();
+			var lr2 = rollSheet.getLastRow();
 			if (rollSheet.getLastColumn() < headerLen) rollSheet.insertColumnsAfter(rollSheet.getLastColumn(), headerLen - rollSheet.getLastColumn());
-			rollSheet.getRange(lr, 1, 1, headerLen).setValues([rowVals]);
+			rollSheet.getRange(lr2, 1, 1, headerLen).setValues([rowVals]);
 		}
 	}
+	// Ensure sheet sorted latest date first
+	var lastR2 = rollSheet.getLastRow();
+	if (lastR2 > 2) rollSheet.getRange(2, 1, lastR2 - 1, headerLen).sort({column: 1, ascending: false});
 	LOG.info('rollup', 'dailyRollupIncremental:end', '', 'Updated days', { days: targetDays.length, formats: fmtList.length });
 }
