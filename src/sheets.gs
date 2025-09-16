@@ -4,6 +4,7 @@ function onOpen() {
 	var ui = SpreadsheetApp.getUi();
 	ui.createMenu('Chess.com')
 		.addItem('Build Sheets', 'buildSheets')
+		.addItem('Seed Settings Defaults', 'seedSettingsDefaults')
 		.addItem('Update Archives', 'updateArchives')
 		.addItem('Fetch & Write Games', 'fetchAndWriteGames')
 		.addItem('Process Callback Queue', 'processCallbackQueue')
@@ -35,4 +36,10 @@ function buildSheets() {
 	s = U.getOrCreateSheet(CONST.SHEET.LOGS);
 	U.ensureHeaders(s, ['ts', 'level', 'scope', 'action', 'key', 'message', 'data_json']);
 	LOG.info('system', 'buildSheets', '', 'Completed');
+}
+
+function seedSettingsDefaults() {
+	LOG.info('system', 'seedSettingsDefaults', '', 'Starting');
+	U.setKeyValueSettings(CONST.SETTINGS_DEFAULTS);
+	LOG.info('system', 'seedSettingsDefaults', '', 'Completed');
 }
