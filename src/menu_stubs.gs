@@ -174,6 +174,15 @@ function mapGameToRow(game, username, archiveId, archiveName, archiveUrl, gh) {
 	var ecoCode = pgnInfo.ecoCode || '';
 	var ecoUrl = pgnInfo.ecoUrl || (String(game.eco || '').startsWith('http') ? String(game.eco) : '');
 	var callbackUrl = deriveCallbackUrl(String(game.url || ''), gameType);
+	// Derive simple outcomes from Chess.com result codes
+	var myOutcome = mapResultCodeToOutcome(String(me.result || ''));
+	var oppOutcome = mapResultCodeToOutcome(String(opp.result || ''));
+	if (!myOutcome && oppOutcome) {
+		myOutcome = (oppOutcome === 'win') ? 'loss' : (oppOutcome === 'loss') ? 'win' : oppOutcome;
+	}
+	if (!oppOutcome && myOutcome) {
+		oppOutcome = (myOutcome === 'win') ? 'loss' : (myOutcome === 'loss') ? 'win' : myOutcome;
+	}
 
 	var row = new Array(CONST.GAMES_HEADERS.length);
 	row[gh['archive_id'] - 1] = archiveId;
@@ -187,6 +196,7 @@ function mapGameToRow(game, username, archiveId, archiveName, archiveUrl, gh) {
 	row[gh['my.color'] - 1] = myColor;
 	row[gh['my.rating'] - 1] = Number(me.rating || '');
 	row[gh['my.result'] - 1] = String(me.result || '');
+	row[gh['my.outcome'] - 1] = myOutcome || '';
 	row[gh['my.accuracy'] - 1] = (myAcc != null && myAcc !== '') ? Number(myAcc) : '';
 	row[gh['my.pregame_rating'] - 1] = '';
 	row[gh['opponent.username'] - 1] = String(opp.username || '');
@@ -195,6 +205,7 @@ function mapGameToRow(game, username, archiveId, archiveName, archiveUrl, gh) {
 	row[gh['opponent.color'] - 1] = meIsWhite ? 'black' : 'white';
 	row[gh['opponent.rating'] - 1] = Number(opp.rating || '');
 	row[gh['opponent.result'] - 1] = String(opp.result || '');
+	row[gh['opponent.outcome'] - 1] = oppOutcome || '';
 	row[gh['opponent.accuracy'] - 1] = (oppAcc != null && oppAcc !== '') ? Number(oppAcc) : '';
 	row[gh['opponent.pregame_rating'] - 1] = '';
 	row[gh['is_rated'] - 1] = String(game.rated || game.is_rated || '') || '';
@@ -292,6 +303,19 @@ function parsePgnHeadersAndMoves(pgn) {
 	return out;
 }
 
+function mapResultCodeToOutcome(resultCode) {
+	var rc = String(resultCode || '').toLowerCase();
+	if (!rc) return '';
+	// Wins
+	if (rc === 'win' || rc === 'checkmate' || rc === 'chesscom') return 'win';
+	// Losses
+	if (rc === 'checkmated' || rc === 'timeout' || rc === 'resigned' || rc === 'abandoned' || rc === 'lose' || rc === 'resign') return 'loss';
+	// Draws
+	if (rc === 'agreed' || rc === 'repetition' || rc === 'stalemate' || rc === 'insufficient' || rc === 'timevsinsufficient' || rc === '50move' || rc === 'seventyfive-move' || rc === 'fivefold-repetition') return 'draw';
+	// Unknown/misc
+	return '';
+}
+
 function deriveArchiveNameFromUrl(archiveUrl) {
 	if (!archiveUrl) return '';
 	var parts = String(archiveUrl).split('/');
@@ -384,6 +408,32 @@ function processCallbackQueue() {
 					}
 					var curOpp = Number(row[oppRatingIdx] || 0);
 					if (rcOpp != null && curOpp) row[oppPreIdx] = curOpp - rcOpp;
+				}
+				// Backfill outcomes if missing, using callback colorOfWinner when available
+				var myOutcomeIdx = gh['my.outcome'] ? gh['my.outcome'] - 1 : -1;
+				var oppOutcomeIdx = gh['opponent.outcome'] ? gh['opponent.outcome'] - 1 : -1;
+				if (myOutcomeIdx >= 0 && oppOutcomeIdx >= 0) {
+					var curMyOutcome = String(row[myOutcomeIdx] || '');
+					var curOppOutcome = String(row[oppOutcomeIdx] || '');
+					if (!curMyOutcome || !curOppOutcome) {
+						var myColor = gh['my.color'] ? String(row[gh['my.color'] - 1] || '').toLowerCase() : '';
+						var cow = String(j.colorOfWinner || '').toLowerCase();
+						if (cow === 'white' || cow === 'black') {
+							var mine = (cow === myColor) ? 'win' : 'loss';
+							row[myOutcomeIdx] = row[myOutcomeIdx] || mine;
+							row[oppOutcomeIdx] = row[oppOutcomeIdx] || (mine === 'win' ? 'loss' : 'win');
+						} else {
+							// Fallback to mapping result codes already present in row
+							var resMine = gh['my.result'] ? String(row[gh['my.result'] - 1] || '') : '';
+							var resOpp = gh['opponent.result'] ? String(row[gh['opponent.result'] - 1] || '') : '';
+							var oMine = mapResultCodeToOutcome(resMine);
+							var oOpp = mapResultCodeToOutcome(resOpp);
+							if (!oMine && oOpp) oMine = (oOpp === 'win') ? 'loss' : (oOpp === 'loss') ? 'win' : oOpp;
+							if (!oOpp && oMine) oOpp = (oMine === 'win') ? 'loss' : (oMine === 'loss') ? 'win' : oMine;
+							if (oMine) row[myOutcomeIdx] = row[myOutcomeIdx] || oMine;
+							if (oOpp) row[oppOutcomeIdx] = row[oppOutcomeIdx] || oOpp;
+						}
+					}
 				}
 			} else {
 				row[gh['callback.status'] - 1] = 'error';
@@ -554,17 +604,22 @@ function dailyRollupRebuild() {
 			if (!(endDt2 && endDt2 instanceof Date)) continue;
 			var day = Utilities.formatDate(endDt2, tz, 'yyyy-MM-dd');
 			if (!agg[day]) agg[day] = { all: { wins: 0, losses: 0, draws: 0, duration: 0 }, byFmt: {} };
-			var res = String(row[gh['my.result'] - 1] || '').toLowerCase();
-			if (res === 'win') agg[day].all.wins++;
-			else if (res === 'loss') agg[day].all.losses++;
-			else if (res === 'draw' || res === 'stalemate' || res === 'agreed') agg[day].all.draws++;
+			var resOutcome = '';
+			if (gh['my.outcome']) resOutcome = String(row[gh['my.outcome'] - 1] || '').toLowerCase();
+			if (!resOutcome) {
+				var code = String(row[gh['my.result'] - 1] || '');
+				resOutcome = mapResultCodeToOutcome(code);
+			}
+			if (resOutcome === 'win') agg[day].all.wins++;
+			else if (resOutcome === 'loss') agg[day].all.losses++;
+			else if (resOutcome === 'draw') agg[day].all.draws++;
 			agg[day].all.duration += Number(row[gh['duration'] - 1] || 0);
 			var fmt2 = String(row[gh['format'] - 1] || '').trim();
 			if (fmt2) {
 				if (!agg[day].byFmt[fmt2]) agg[day].byFmt[fmt2] = { wins: 0, losses: 0, draws: 0, duration: 0 };
-				if (res === 'win') agg[day].byFmt[fmt2].wins++;
-				else if (res === 'loss') agg[day].byFmt[fmt2].losses++;
-				else if (res === 'draw' || res === 'stalemate' || res === 'agreed') agg[day].byFmt[fmt2].draws++;
+				if (resOutcome === 'win') agg[day].byFmt[fmt2].wins++;
+				else if (resOutcome === 'loss') agg[day].byFmt[fmt2].losses++;
+				else if (resOutcome === 'draw') agg[day].byFmt[fmt2].draws++;
 				agg[day].byFmt[fmt2].duration += Number(row[gh['duration'] - 1] || 0);
 			}
 		}
@@ -752,17 +807,22 @@ function dailyRollupIncremental(dates) {
 		var day = Utilities.formatDate(endDt, tz, 'yyyy-MM-dd');
 		if (!set[day]) continue;
 		if (!agg[day]) agg[day] = { all: { wins: 0, losses: 0, draws: 0, duration: 0 }, byFmt: {} };
-		var res = String(row[gh['my.result'] - 1] || '').toLowerCase();
-		if (res === 'win') agg[day].all.wins++;
-		else if (res === 'loss') agg[day].all.losses++;
-		else if (res === 'draw' || res === 'stalemate' || res === 'agreed') agg[day].all.draws++;
+		var resOutcome = '';
+		if (gh['my.outcome']) resOutcome = String(row[gh['my.outcome'] - 1] || '').toLowerCase();
+		if (!resOutcome) {
+			var code = String(row[gh['my.result'] - 1] || '');
+			resOutcome = mapResultCodeToOutcome(code);
+		}
+		if (resOutcome === 'win') agg[day].all.wins++;
+		else if (resOutcome === 'loss') agg[day].all.losses++;
+		else if (resOutcome === 'draw') agg[day].all.draws++;
 		agg[day].all.duration += Number(row[gh['duration'] - 1] || 0);
 		var fmt = String(row[gh['format'] - 1] || '').trim();
 		if (fmt) {
 			if (!agg[day].byFmt[fmt]) agg[day].byFmt[fmt] = { wins: 0, losses: 0, draws: 0, duration: 0 };
-			if (res === 'win') agg[day].byFmt[fmt].wins++;
-			else if (res === 'loss') agg[day].byFmt[fmt].losses++;
-			else if (res === 'draw' || res === 'stalemate' || res === 'agreed') agg[day].byFmt[fmt].draws++;
+			if (resOutcome === 'win') agg[day].byFmt[fmt].wins++;
+			else if (resOutcome === 'loss') agg[day].byFmt[fmt].losses++;
+			else if (resOutcome === 'draw') agg[day].byFmt[fmt].draws++;
 			agg[day].byFmt[fmt].duration += Number(row[gh['duration'] - 1] || 0);
 		}
 	}
