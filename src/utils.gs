@@ -78,6 +78,22 @@ var U = (function() {
 		if (writes.length) sh.getRange(sh.getLastRow() + 1, 1, writes.length, 2).setValues(writes);
 	}
 
+	function getScriptProp(key) {
+		try {
+			return PropertiesService.getScriptProperties().getProperty(String(key));
+		} catch (e) {
+			return null;
+		}
+	}
+
+	function setScriptProp(key, value) {
+		try {
+			PropertiesService.getScriptProperties().setProperty(String(key), String(value));
+		} catch (e) {
+			// ignore
+		}
+	}
+
 	return {
 		getSpreadsheet: getSpreadsheet,
 		getOrCreateSheet: getOrCreateSheet,
@@ -86,6 +102,8 @@ var U = (function() {
 		readSettings: readSettings,
 		toSheetDate: toSheetDate,
 		now: now,
-		setKeyValueSettings: setKeyValueSettings
+		setKeyValueSettings: setKeyValueSettings,
+		getScriptProp: getScriptProp,
+		setScriptProp: setScriptProp
 	};
 })();
